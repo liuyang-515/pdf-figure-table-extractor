@@ -111,7 +111,28 @@ def _graphic_rects(page: pymupdf.Page) -> list[pymupdf.Rect]:
     rects = [pymupdf.Rect(item["rect"]) for item in page.get_drawings()]
     for image in page.get_images(full=True):
         rects.extend(page.get_image_rects(image[0]))
-    return [rect for rect in rects if rect.width > 1 and rect.height > 1]
+    page_rect = page.rect
+    usable = []
+    for rect in rects:
+        if rect.width > page_rect.width * 2 or rect.height > page_rect.height * 2:
+            continue
+        if rect.width < 0.5:
+            rect.x0 -= 0.25
+            rect.x1 += 0.25
+        if rect.height < 0.5:
+            rect.y0 -= 0.25
+            rect.y1 += 0.25
+        rect &= page_rect
+        in_header_or_footer = (
+            rect.y1 <= page_rect.y0 + 70 or rect.y0 >= page_rect.y1 - 70
+        )
+        if (
+            not rect.is_empty
+            and max(rect.width, rect.height) > 1
+            and not in_header_or_footer
+        ):
+            usable.append(rect)
+    return usable
 
 
 def _distance(a: pymupdf.Rect, b: pymupdf.Rect) -> tuple[float, float]:
@@ -133,7 +154,7 @@ def _cluster_rects(rects: list[pymupdf.Rect]) -> list[pymupdf.Rect]:
                 other = clusters[index]
                 dx, dy = _distance(current, other)
                 x_overlap = min(current.x1, other.x1) - max(current.x0, other.x0)
-                if (dx <= 8 and dy <= 8) or (x_overlap > 0 and dy <= 5):
+                if (dx <= 8 and dy <= 8) or (x_overlap > 0 and dy <= 36):
                     current |= clusters.pop(index)
                     changed = True
                     index = 0
@@ -167,15 +188,22 @@ def _pick_graphics(
     candidates: list[tuple[float, pymupdf.Rect]] = []
 
     if caption.kind == "figure":
+        figure_area = pymupdf.Rect(
+            column.x0,
+            max(column.y0, page.rect.y0 + 70),
+            column.x1,
+            caption.rect.y0,
+        )
         for rect in clusters:
+            rect &= figure_area
             gap = caption.rect.y0 - rect.y1
             if (
-                -8 <= gap <= 360
-                and rect.y0 < caption.rect.y0
+                not rect.is_empty
+                and 0 <= gap <= 360
                 and rect.width >= 35
                 and rect.height >= 25
             ):
-                candidates.append((max(gap, 0), rect))
+                candidates.append((gap, rect))
     else:
         limit = _next_caption_limit(captions, caption, column.y1)
         for rect in clusters:
@@ -208,13 +236,27 @@ def _expand_to_content(
         if include_figure_captions:
             crop |= caption.rect
             search |= caption.rect
+        for word in _word_rects(page):
+            if word.intersects(search):
+                crop |= word
+        crop.y0 = max(crop.y0, page.rect.y0 + 70)
     else:
-        crop = graphics | caption.rect
-        search = pymupdf.Rect(crop.x0 - 5, caption.rect.y0 - 2, crop.x1 + 5, crop.y1 + 5)
-
-    for word in _word_rects(page):
-        if word.intersects(search):
-            crop |= word
+        words = _word_rects(page)
+        content = pymupdf.Rect(graphics)
+        content_is_above = content.y0 < caption.rect.y0
+        changed = True
+        while changed:
+            changed = False
+            for word in words:
+                if content_is_above and word.y1 > caption.rect.y0:
+                    continue
+                if not content_is_above and word.y0 < caption.rect.y1:
+                    continue
+                dx, dy = _distance(content, word)
+                if dx <= 8 and dy <= 8 and not content.contains(word):
+                    content |= word
+                    changed = True
+        crop = content | caption.rect
     crop += (-3, -3, 3, 3)
     return crop & page.rect
 
@@ -254,6 +296,8 @@ def _fallback_crop(
         crop = pymupdf.Rect(column.x0, top, column.x1, caption.rect.y0 - 2)
         if include_figure_captions:
             crop |= caption.rect
+        if crop.height - caption.rect.height < 40:
+            return None
         return crop
 
     bottom = _next_caption_limit(captions, caption, column.y1)
@@ -273,28 +317,25 @@ def _fallback_crop(
     below_gap = below[0][0].y0 - caption.rect.y1 if below else float("inf")
     above_size = above[0][1] if above else float("inf")
     below_size = below[0][1] if below else float("inf")
-    previous_table = any(
-        other is not caption
-        and other.kind == "table"
-        and other.rect.y1 < caption.rect.y0
-        and min(other.rect.x1, caption.rect.x1) > max(other.rect.x0, caption.rect.x0)
-        for other in captions
-    )
     wider_below = (
         above
         and below
         and below[0][0].width > above[0][0].width * 1.5
         and below_gap <= above_gap + 5
     )
-    use_above = (
-        not previous_table
-        and not wider_below
-        and (
-            above_size + 0.75 < below_size
-            or abs(above_size - below_size) <= 0.75
-            and above_gap < below_gap
+    if not below:
+        use_above = True
+    elif not above:
+        use_above = False
+    else:
+        use_above = (
+            not wider_below
+            and (
+                above_size + 0.75 < below_size
+                or abs(above_size - below_size) <= 0.75
+                and above_gap < below_gap
+            )
         )
-    )
     if use_above:
         crop = caption.rect | above[0][0]
         for rect, _ in above[1:]:

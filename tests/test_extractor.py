@@ -80,3 +80,48 @@ def test_rerun_preserves_unrelated_files(tmp_path: Path) -> None:
     extract_assets(pdf_path, output_dir, dpi=144)
 
     assert unrelated.read_text(encoding="utf-8") == "keep"
+
+
+def test_extracts_consecutive_tables_with_captions_below(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    output_dir = tmp_path / "assets"
+    document = pymupdf.open()
+    page = document.new_page(width=612, height=792)
+
+    for number, top in ((1, 100), (2, 300)):
+        page.insert_text((80, top), "Model        Accuracy", fontsize=9)
+        page.insert_text((80, top + 22), "Small        82.0", fontsize=9)
+        page.insert_text((80, top + 44), "Large        91.5", fontsize=9)
+        page.insert_textbox(
+            pymupdf.Rect(60, top + 65, 285, top + 100),
+            f"Table {number}: Table with its caption below the data.",
+            fontsize=9,
+        )
+
+    document.save(pdf_path)
+    document.close()
+
+    assets = extract_assets(pdf_path, output_dir, dpi=144)
+
+    assert [(asset.kind, asset.label) for asset in assets] == [
+        ("table", "1"),
+        ("table", "2"),
+    ]
+
+
+def test_ignores_prose_starting_with_a_figure_reference(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    output_dir = tmp_path / "assets"
+    document = pymupdf.open()
+    page = document.new_page(width=612, height=792)
+    page.insert_textbox(
+        pymupdf.Rect(60, 100, 550, 150),
+        "Figure 18. Our method generates progressively finer identifiers for each item.",
+        fontsize=11,
+    )
+    document.save(pdf_path)
+    document.close()
+
+    assets = extract_assets(pdf_path, output_dir, dpi=144)
+
+    assert assets == []
